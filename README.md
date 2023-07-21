@@ -19,7 +19,7 @@ Check HTTP_AUTH_LDAP options
 ## Linux
 
 ```bash
-cd ~ && git clone https://github.com/kvspb/nginx-auth-ldap.git   
+cd ~ && git clone https://github.com/selboo/nginx-auth-ldap.git
 ```
 
 in nginx source folder
@@ -33,6 +33,9 @@ make install
 Define list of your LDAP servers with required user/group requirements:
 
 ```bash
+
+    load_module modules/ngx_http_auth_ldap_module.so;
+
     http {
       ldap_server test1 {
         url ldap://192.168.0.1:3268/DC=test,DC=local?sAMAccountName?sub?(objectClass=person);
@@ -51,6 +54,10 @@ Define list of your LDAP servers with required user/group requirements:
         group_attribute_is_dn on;
         require valid_user;
       }
+
+      auth_ldap_cache_enabled on;
+      auth_ldap_cache_expiration_time 60000; # 60s
+      auth_ldap_cache_size 1024;
     }
 ```
 
@@ -112,29 +119,6 @@ http_auth_ldap: ldap_result() failed (-1: Can't contact LDAP server)
 
 ## connections
 expected value: a number greater than 0
-
-## ssl_check_cert
-expected value: on or off, default off
-
-Verify the remote certificate for LDAPs connections. If disabled, any remote certificate will be
-accepted which exposes you to possible man-in-the-middle attacks. Note that the server's
-certificate will need to be signed by a proper CA trusted by your system if this is enabled.
-See below how to trust CAs without installing them system-wide.
-
-This options needs OpenSSL >= 1.0.2; it is unavailable if compiled with older versions.
-
-## ssl_ca_file
-expected value: file path
-
-Trust the CA certificate in this file (see ssl_check_cert above).
-
-## ssl_ca_dir
-expected value: directory path
-
-Trust all CA certificates in this directory (see ssl_check_cert above).
-
-Note that you need to provide hash-based symlinks in the directory for this to work;
-you'll basically need to run OpenSSL's c_rehash command in this directory.
 
 ## referral
 expected value: on, off

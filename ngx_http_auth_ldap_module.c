@@ -31,7 +31,6 @@
 #include <ngx_http.h>
 #include <ngx_md5.h>
 #include <ldap.h>
-#include <openssl/opensslv.h>
 
 // used for manual warnings
 #define XSTR(x) STR(x)
@@ -82,10 +81,6 @@ typedef struct {
     ngx_str_t group_attribute;
     ngx_flag_t group_attribute_dn;
 
-    ngx_flag_t ssl_check_cert;
-    ngx_str_t ssl_ca_dir;
-    ngx_str_t ssl_ca_file;
-
     ngx_array_t *require_group;     /* array of ngx_http_complex_value_t */
     ngx_array_t *require_user;      /* array of ngx_http_complex_value_t */
     ngx_flag_t require_valid_user;
@@ -110,9 +105,6 @@ typedef struct {
     ngx_msec_t cache_expiration_time;
     size_t cache_size;
     ngx_int_t servers_size;
-#if (NGX_OPENSSL)
-    ngx_ssl_t ssl;
-#endif
 } ngx_http_auth_ldap_main_conf_t;
 
 typedef struct {
@@ -182,11 +174,6 @@ typedef struct ngx_http_auth_ldap_connection {
     ngx_peer_connection_t conn;
     ngx_event_t reconnect_event;
 
-#if (NGX_OPENSSL)
-    ngx_pool_t *pool;
-    ngx_ssl_t *ssl;
-#endif
-
     ngx_queue_t queue;
     ngx_http_auth_ldap_ctx_t *rctx;
 
@@ -222,9 +209,7 @@ static ngx_int_t ngx_http_auth_ldap_check_user(ngx_http_request_t *r, ngx_http_a
 static ngx_int_t ngx_http_auth_ldap_check_group(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx);
 static ngx_int_t ngx_http_auth_ldap_check_bind(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx);
 static ngx_int_t ngx_http_auth_ldap_recover_bind(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx);
-#if (NGX_OPENSSL)
-static ngx_int_t ngx_http_auth_ldap_restore_handlers(ngx_connection_t *conn);
-#endif
+
 
 ngx_http_auth_ldap_cache_t ngx_http_auth_ldap_cache;
 
@@ -431,22 +416,6 @@ ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
             return NGX_CONF_ERROR;
         }
         server->connections = i;
-    } else if (ngx_strcmp(value[0].data, "ssl_check_cert") == 0  && ngx_strcmp(value[1].data, "on") == 0) {
-      #if OPENSSL_VERSION_NUMBER >= 0x10002000
-      server->ssl_check_cert = 1;
-      #else
-      #if GNUC > 4
-      #warning "http_auth_ldap: Compiling with OpenSSL < 1.0.2, certificate verification will be unavailable. OPENSSL_VERSION_NUMBER == " XSTR(OPENSSL_VERSION_NUMBER)
-      #endif
-      ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-        "http_auth_ldap: 'ssl_cert_check': cannot verify remote certificate's domain name because "
-        "your version of OpenSSL is too old. "
-        "Please install OpenSSL >= 1.02 and recompile nginx.");
-      #endif
-    } else if (ngx_strcmp(value[0].data, "ssl_ca_dir") == 0) {
-      server->ssl_ca_dir = value[1];
-    } else if (ngx_strcmp(value[0].data, "ssl_ca_file") == 0) {
-      server->ssl_ca_file = value[1];
     }
     else CONF_MSEC_VALUE(cf,value,server,connect_timeout)
     else CONF_MSEC_VALUE(cf,value,server,reconnect_timeout)
@@ -628,17 +597,6 @@ ngx_http_auth_ldap_parse_url(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server
 
     if (ngx_strcmp(server->ludpp->lud_scheme, "ldap") == 0) {
         return NGX_CONF_OK;
-#if (NGX_OPENSSL)
-    } else if (ngx_strcmp(server->ludpp->lud_scheme, "ldaps") == 0) {
-        ngx_http_auth_ldap_main_conf_t *halmcf =
-            ngx_http_conf_get_module_main_conf(cf, ngx_http_auth_ldap_module);
-        ngx_uint_t protos = NGX_SSL_SSLv2 | NGX_SSL_SSLv3 |
-            NGX_SSL_TLSv1 | NGX_SSL_TLSv1_1 | NGX_SSL_TLSv1_2;
-        if (halmcf->ssl.ctx == NULL && ngx_ssl_create(&halmcf->ssl, protos, halmcf) != NGX_OK) {
-            return NGX_CONF_ERROR;
-        }
-        return NGX_CONF_OK;
-#endif
     } else {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "http_auth_ldap: Protocol \"%s://\" is not supported.",
             server->ludpp->lud_scheme);
@@ -1096,13 +1054,6 @@ ngx_http_auth_ldap_close_connection(ngx_http_auth_ldap_connection_t *c)
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0, "http_auth_ldap: Closing connection (fd=%d)",
             c->conn.connection->fd);
 
-#if (NGX_OPENSSL)
-        if (c->conn.connection->ssl) {
-            c->conn.connection->ssl->no_wait_shutdown = 1;
-            (void) ngx_ssl_shutdown(c->conn.connection);
-        }
-#endif
-
         ngx_close_connection(c->conn.connection);
         c->conn.connection = NULL;
     }
@@ -1229,34 +1180,6 @@ ngx_http_auth_ldap_dummy_write_handler(ngx_event_t *wev)
 }
 
 
-#if (NGX_OPENSSL)
-/* Make sure the event handlers are activated. */
-static ngx_int_t
-ngx_http_auth_ldap_restore_handlers(ngx_connection_t *conn)
-{
-    ngx_int_t rc;
-
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, conn->log, 0, "http_auth_ldap: Restoring event handlers. read=%d write=%d", conn->read->active, conn->write->active);
-
-    if (!conn->read->active) {
-        rc = ngx_add_event(conn->read, NGX_READ_EVENT, 0);
-        if (rc != NGX_OK) {
-            return rc;
-        }
-    }
-
-    if (!conn->write->active &&
-        (conn->write->handler != ngx_http_auth_ldap_dummy_write_handler)) {
-        rc = ngx_add_event(conn->write, NGX_WRITE_EVENT, 0);
-        if (rc != NGX_OK) {
-            return rc;
-        }
-    }
-
-    return NGX_OK;
-}
-#endif
-
 static void
 ngx_http_auth_ldap_connection_established(ngx_http_auth_ldap_connection_t *c)
 {
@@ -1320,140 +1243,6 @@ ngx_http_auth_ldap_connection_established(ngx_http_auth_ldap_connection_t *c)
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0, "http_auth_ldap: bind_timeout=%d", c->server->bind_timeout);
 }
 
-#if (NGX_OPENSSL)
-static void
-ngx_http_auth_ldap_ssl_handshake_handler(ngx_connection_t *conn, ngx_flag_t validate)
-{
-    ngx_http_auth_ldap_connection_t *c;
-    c = conn->data;
-
-    if (conn->ssl->handshaked) {
-        #if OPENSSL_VERSION_NUMBER >= 0x10002000
-        if (validate) { // verify remote certificate if requested
-          X509 *cert = SSL_get_peer_certificate(conn->ssl->connection);
-          long chain_verified = SSL_get_verify_result(conn->ssl->connection);
-
-          int addr_verified;
-          char *hostname = c->server->ludpp->lud_host;
-          addr_verified = X509_check_host(cert, hostname, 0, 0, 0);
-
-          if (!addr_verified) { // domain not in cert? try IP
-            size_t len; // get IP length
-            if (conn->sockaddr->sa_family == 4) len = 4;
-            else if (conn->sockaddr->sa_family == 6) len = 16;
-            else { // very unlikely indeed
-              ngx_http_auth_ldap_close_connection(c);
-              return;
-            }
-            addr_verified = X509_check_ip(cert, (const unsigned char*)conn->sockaddr->sa_data, len, 0);
-          }
-
-          // Find anything fishy?
-          if ( !(cert && addr_verified && chain_verified == X509_V_OK) ) {
-            if (!addr_verified) {
-              ngx_log_error(NGX_LOG_ERR, c->log, 0,
-                "http_auth_ldap: Remote side presented invalid SSL certificate: "
-                "does not match address (neither server's domain nor IP in certificate's CN or SAN)");
-                fprintf(stderr, "DEBUG: SSL cert domain mismatch\n"); fflush(stderr);
-            } else {
-              ngx_log_error(NGX_LOG_ERR, c->log, 0,
-                "http_auth_ldap: Remote side presented invalid SSL certificate: error %l, %s",
-                chain_verified, X509_verify_cert_error_string(chain_verified));
-            }
-            ngx_http_auth_ldap_close_connection(c);
-            return;
-          }
-        }
-        #endif
-
-        // handshaked validation successful -- or not required in the first place
-        conn->read->handler = &ngx_http_auth_ldap_read_handler;
-        ngx_http_auth_ldap_restore_handlers(conn);
-        ngx_http_auth_ldap_connection_established(c);
-        return;
-    }
-    else { // handshake failed
-      ngx_log_error(NGX_LOG_ERR, c->log, 0, "http_auth_ldap: SSL handshake failed");
-      ngx_http_auth_ldap_close_connection(c);
-    }
-}
-
-static void
-ngx_http_auth_ldap_ssl_handshake_validating_handler(ngx_connection_t *conn)
-{ ngx_http_auth_ldap_ssl_handshake_handler(conn, 1); }
-
-static void
-ngx_http_auth_ldap_ssl_handshake_non_validating_handler(ngx_connection_t *conn)
-{ ngx_http_auth_ldap_ssl_handshake_handler(conn, 0); }
-
-typedef void (*ngx_http_auth_ldap_ssl_callback)(ngx_connection_t *conn);
-
-static void
-ngx_http_auth_ldap_ssl_handshake(ngx_http_auth_ldap_connection_t *c)
-{
-    ngx_int_t rc;
-
-    c->conn.connection->pool = c->pool;
-    rc = ngx_ssl_create_connection(c->ssl, c->conn.connection, NGX_SSL_BUFFER | NGX_SSL_CLIENT);
-    if (rc != NGX_OK) {
-        ngx_log_error(NGX_LOG_ERR, c->log, 0, "http_auth_ldap: SSL initialization failed");
-        ngx_http_auth_ldap_close_connection(c);
-        return;
-    }
-
-    c->log->action = "SSL handshaking to LDAP server";
-    ngx_connection_t *transport = c->conn.connection;
-
-    ngx_http_auth_ldap_ssl_callback callback;
-    if (c->server->ssl_check_cert) {
-      // load CA certificates: custom ones if specified, default ones instead
-      if (c->server->ssl_ca_file.data || c->server->ssl_ca_dir.data) {
-#if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
-        int setcode = SSL_CTX_load_verify_locations(transport->ssl->session_ctx,
-          (char*)(c->server->ssl_ca_file.data), (char*)(c->server->ssl_ca_dir.data));
-#else
-        int setcode = SSL_CTX_load_verify_locations(transport->ssl->connection->ctx,
-          (char*)(c->server->ssl_ca_file.data), (char*)(c->server->ssl_ca_dir.data));
-#endif
-        if (setcode != 1) {
-          unsigned long error_code = ERR_get_error();
-          char *error_msg = ERR_error_string(error_code, NULL);
-          ngx_log_error(NGX_LOG_ERR, c->log, 0,
-            "http_auth_ldap: SSL initialization failed. Could not set custom CA certificate location. "
-            "Error: %lu, %s", error_code, error_msg);
-        }
-      }
-#if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
-      int setcode = SSL_CTX_set_default_verify_paths(transport->ssl->session_ctx);
-#else
-      int setcode = SSL_CTX_set_default_verify_paths(transport->ssl->connection->ctx);
-#endif
-      if (setcode != 1) {
-        unsigned long error_code = ERR_get_error();
-        char *error_msg = ERR_error_string(error_code, NULL);
-        ngx_log_error(NGX_LOG_ERR, c->log, 0,
-          "http_auth_ldap: SSL initialization failed. Could not use default CA certificate location. "
-          "Error: %lu, %s", error_code, error_msg);
-      }
-
-      // use validating version of next function
-      callback = &ngx_http_auth_ldap_ssl_handshake_validating_handler;
-    } else {
-      // use non-validating version of next function
-      callback = &ngx_http_auth_ldap_ssl_handshake_non_validating_handler;
-    }
-
-    rc = ngx_ssl_handshake(transport);
-    if (rc == NGX_AGAIN) {
-        transport->ssl->handler = callback;
-        return;
-    }
-
-    (*callback)(transport);
-    return;
-}
-#endif
-
 static void
 ngx_http_auth_ldap_connect_handler(ngx_event_t *wev)
 {
@@ -1476,13 +1265,6 @@ ngx_http_auth_ldap_connect_handler(ngx_event_t *wev)
     {
         ngx_log_error(NGX_LOG_ALERT, c->log, ngx_socket_errno, "http_auth_ldap: setsockopt(SO_KEEPALIVE) failed");
     }
-
-#if (NGX_OPENSSL)
-    if (ngx_strcmp(c->server->ludpp->lud_scheme, "ldaps") == 0) {
-        ngx_http_auth_ldap_ssl_handshake(c);
-        return;
-    }
-#endif
 
     ngx_http_auth_ldap_connection_established(c);
 }
@@ -1675,9 +1457,7 @@ ngx_http_auth_ldap_connect(ngx_http_auth_ldap_connection_t *c)
 
     conn = pconn->connection;
     conn->data = c;
-#if (NGX_OPENSSL)
-    conn->pool = c->pool;
-#endif
+
     conn->write->handler = ngx_http_auth_ldap_connect_handler;
     conn->read->handler = ngx_http_auth_ldap_read_handler;
     ngx_add_timer(conn->read, c->server->connect_timeout);
@@ -1750,11 +1530,6 @@ ngx_http_auth_ldap_init_connections(ngx_cycle_t *cycle)
             c->reconnect_event.log = c->log;
             c->reconnect_event.data = dummy_conn;
             c->reconnect_event.handler = ngx_http_auth_ldap_reconnect_handler;
-
-#if (NGX_OPENSSL)
-            c->pool = cycle->pool;
-            c->ssl = &halmcf->ssl;
-#endif
 
             ngx_http_auth_ldap_connect(c);
         }
